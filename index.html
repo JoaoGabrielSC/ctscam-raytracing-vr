@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Volume Raycasting Demo - Three.js</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: 'Inter', sans-serif; /* Prefer Inter font */
+            background-color: #1a1a1a;
+            color: #e0e0e0;
+            display: flex;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        #container {
+            flex-grow: 1;
+            position: relative;
+            background-color: #2c2c2c;
+            border-radius: 12px; /* Rounded corners */
+            margin: 10px;
+            overflow: hidden;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.4);
+        }
+
+        #hud {
+            width: 300px;
+            background-color: #3a3a3a;
+            padding: 20px;
+            margin: 10px;
+            border-radius: 12px; /* Rounded corners */
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.4);
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            overflow-y: auto;
+        }
+
+        #hud h2, #hud h3 {
+            color: #ffffff;
+            margin-top: 0;
+            margin-bottom: 10px;
+            font-size: 1.4em;
+            border-bottom: 1px solid #555;
+            padding-bottom: 5px;
+        }
+
+        #hud p {
+            margin: 5px 0;
+            font-size: 0.95em;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        #hud p span {
+            font-weight: bold;
+            color: #8cffff; /* Light blue for values */
+            text-align: right;
+            flex-grow: 1;
+            padding-left: 10px;
+            word-break: break-all; /* Allow breaking long text */
+        }
+
+        #preview-container {
+            margin-top: 20px;
+            border-top: 1px solid #555;
+            padding-top: 15px;
+            text-align: center;
+        }
+
+        #preview-canvas {
+            border: 1px solid #555;
+            background-color: #000;
+            border-radius: 8px;
+            width: 100%; /* Make preview responsive within its container */
+            max-width: 250px; /* Max width for preview */
+            height: auto; /* Maintain aspect ratio */
+            display: block; /* Remove extra space below canvas */
+            margin: 0 auto; /* Center the preview canvas */
+        }
+
+        /* Responsive adjustments */
+        @media (max-width: 768px) {
+            body {
+                flex-direction: column;
+            }
+            #hud {
+                width: auto;
+                margin: 10px;
+                order: -1; /* Move HUD to top on small screens */
+            }
+            #container {
+                margin: 10px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div id="container"></div>
+    <div id="hud">
+        <h2>Informações do Raycaster</h2>
+        <p>Posição da Câmera: <span id="camera-pos"></span></p>
+        <p>Direção do Raio: <span id="ray-dir"></span></p>
+        <p>Ponto de Interseção: <span id="intersection-point"></span></p>
+        <p>Número de Amostras: <span id="num-samples">128</span></p>
+        <p>Profundidade Estimada: <span id="estimated-depth">N/A</span></p>
+        <div id="preview-container">
+            <h3>Preview da Câmera</h3>
+            <canvas id="preview-canvas"></canvas>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/examples/js/controls/OrbitControls.js"></script>
+    <script>
+        // --- Shaders GLSL ---
+        // Vertex Shader: Pass through vertices, compute ray origin and direction.
+        // It renders a box, and the fragment shader traces rays through this box.
+        const vertexShaderSource = `
+            varying vec3 vRayOrigin;
+            varying vec3 vRayDirection;
+            uniform mat4 projectionMatrixInverse;
+            uniform mat4 viewMatrixInverse;
+            uniform vec3 cameraWorldPosition;
+            uniform vec2 resolution;
+
+            void main() {
+                // Get the current screen-space fragment coordinate (0-1 range)
+                vec2 ndc = (gl_Position.xy / resolution) * 2.0 - 1.0;
+
+                // Reconstruct the ray direction in world space
+                // This approach directly calculates the ray from camera through the vertex
+                // This works for a bounding box approach where we want to trace from camera
+                // through the specific vertex on the box to determine the ray direction.
+                // A more common approach for fullscreen raymarching would derive ray from gl_FragCoord.
+                vRayOrigin = cameraWorldPosition;
+                vec4 worldPos = modelMatrix * vec4(position, 1.0);
+                vRayDirection = normalize(worldPos.xyz - cameraWorldPosition);
+
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            }
+        `;
+
+        // Fragment Shader: Performs the volume raycasting.
+        const fragmentShaderSource = `
+            uniform vec3 cameraWorldPosition;
+            uniform vec3 volumeCenter;
+            uniform float volumeRadius;
+            uniform float densityScale;
+            uniform int steps;
+            uniform vec2 resolution;
+            uniform mat4 projectionMatrixInverse;
+            uniform mat4 viewMatrixInverse;
+            uniform vec3 uBoxMin;
+            uniform vec3 uBoxMax;
+
+            varying vec3 vRayOrigin;
+            varying vec3 vRayDirection;
+
+            // Function to calculate density at a given point
+            float getDensity(vec3 p) {
+                // Sphere density function: higher density closer to the center of the sphere
+                // Normalize point p relative to volumeCenter to make it local to the sphere
+                vec3 localP = p - volumeCenter;
+                float distToCenter = length(localP);
+                // Return 1.0 at center, 0.0 at radius, smoothly fall off
+                return max(0.0, (volumeRadius - distToCenter) / volumeRadius);
+                // Can also add noise or other patterns for more complex volumes
+            }
+
+            // AABB (Axis-Aligned Bounding Box) intersection
+            // Returns vec2(t_enter, t_exit) or vec2(-1.0, -1.0) if no intersection
+            vec2 intersectBox(vec3 rayOrigin, vec3 rayDirection, vec3 boxMin, vec3 boxMax) {
+                vec3 invDir = 1.0 / rayDirection;
+                vec3 t0 = (boxMin - rayOrigin) * invDir;
+                vec3 t1 = (boxMax - rayOrigin) * invDir;
+
+                vec3 tmin = min(t0, t1);
+                vec3 tmax = max(t0, t1);
+
+                float tEnter = max(max(tmin.x, tmin.y), tmin.z);
+                float tExit = min(min(tmax.x, tmax.y), tmax.z);
+
+                if (tExit < tEnter || tExit < 0.0) {
+                    return vec2(-1.0, -1.0); // No intersection or box is behind ray
+                }
+
+                return vec2(tEnter, tExit);
+            }
+
+            void main() {
+                // Reconstruct ray for the current fragment
+                // This is a common way to get pixel-perfect rays for raymarching/raytracing
+                vec2 screenCoord = (gl_FragCoord.xy / resolution) * 2.0 - 1.0; // NDC [-1, 1]
+
+                // Unproject to clip space, then view space, then world space
+                vec4 clipPos = vec4(screenCoord, 1.0, 1.0); // Z = 1 for far plane (or -1 for near, doesn't matter for direction)
+                vec4 viewPos = projectionMatrixInverse * clipPos;
+                viewPos /= viewPos.w; // Perspective divide
+
+                vec3 rayDirection = normalize((viewMatrixInverse * vec4(viewPos.xyz, 0.0)).xyz); // w=0 for direction vector
+                vec3 rayOrigin = cameraWorldPosition;
+
+                // Intersect ray with the volume's bounding box to find entry and exit points
+                vec2 t_bounds = intersectBox(rayOrigin, rayDirection, uBoxMin, uBoxMax);
+
+                if (t_bounds.x == -1.0 && t_bounds.y == -1.0) {
+                    discard; // No intersection with bounding box, so render nothing
+                }
+
+                float t = t_bounds.x;
+                float tEnd = t_bounds.y;
+
+                // If camera is inside the box, start ray from current position
+                if (t < 0.0) t = 0.0;
+
+                // Step size for raymarching
+                float stepSize = (tEnd - t) / float(steps);
+
+                vec4 accumulatedColor = vec4(0.0);
+                vec3 currentPosition;
+
+                for (int i = 0; i < steps; i++) {
+                    currentPosition = rayOrigin + rayDirection * t;
+                    float density = getDensity(currentPosition);
+
+                    // Simple absorption model: accumulate color and opacity
+                    float alpha = density * densityScale * stepSize; // Scale alpha by density, step size, and uniform
+                    vec3 color = vec3(0.1, 0.5, 0.9); // Example: a blueish cloud color
+                    
+                    // Accumulate color: (current_color * current_alpha) + (accumulated_color * (1 - current_alpha))
+                    accumulatedColor.rgb += color * alpha * (1.0 - accumulatedColor.a);
+                    accumulatedColor.a += alpha;
+
+                    // Early exit if opaque
+                    if (accumulatedColor.a > 0.99) break;
+
+                    t += stepSize;
+                    if (t > tEnd) break; // Stop if past the exit point
+                }
+
+                gl_FragColor = accumulatedColor;
+            }
+        `;
+
+        // --- Configurações da Cena Three.js ---
+        let scene, camera, renderer, controls;
+        let volumeMesh, rayHelper;
+        let hudElements = {};
+        let previewRenderer, previewCamera, previewScene;
+        let renderTarget, previewPlane;
+
+        const container = document.getElementById('container');
+        const hud = document.getElementById('hud');
+        const previewCanvas = document.getElementById('preview-canvas');
+
+        // Volume parameters
+        const volumeCenter = new THREE.Vector3(0, 0, 0);
+        const volumeRadius = 1.0; // For sphere density function
+        const volumeBoxMin = new THREE.Vector3(-volumeRadius, -volumeRadius, -volumeRadius);
+        const volumeBoxMax = new THREE.Vector3(volumeRadius, volumeRadius, volumeRadius);
+        const raymarchingSteps = 128;
+        const densityScale = 10.0; // Adjust for more or less density
+
+        function init() {
+            // Cena
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x2c2c2c); // Match container background
+
+            // Câmera principal
+            camera = new THREE.PerspectiveCamera(75, container.clientWidth / container.clientHeight, 0.1, 100);
+            camera.position.set(2, 2, 3);
+            scene.add(camera);
+
+            // Renderizador principal
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(container.clientWidth, container.clientHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            container.appendChild(renderer.domElement);
+
+            // Controles de Órbita
+            controls = new THREE.OrbitControls();
+            controls.enableDamping = true; // For smoother movement
+            controls.dampingFactor = 0.05;
+            controls.addEventListener('change', updateSceneAndHUD); // Update HUD on camera change
+
+            // --- Volume Raycasting Mesh ---
+            const geometry = new THREE.BoxGeometry(
+                volumeBoxMax.x - volumeBoxMin.x,
+                volumeBoxMax.y - volumeBoxMin.y,
+                volumeBoxMax.z - volumeBoxMin.z
+            ); // Bounding box for the volume
+            geometry.translate(
+                volumeCenter.x,
+                volumeCenter.y,
+                volumeCenter.z
+            );
+
+            // Shader uniforms
+            const uniforms = {
+                cameraWorldPosition: { value: camera.position },
+                volumeCenter: { value: volumeCenter },
+                volumeRadius: { value: volumeRadius },
+                densityScale: { value: densityScale },
+                steps: { value: raymarchingSteps },
+                resolution: { value: new THREE.Vector2(container.clientWidth, container.clientHeight) },
+                projectionMatrixInverse: { value: new THREE.Matrix4() },
+                viewMatrixInverse: { value: new THREE.Matrix4() },
+                uBoxMin: { value: volumeBoxMin },
+                uBoxMax: { value: volumeBoxMax }
+            };
+
+            const material = new THREE.ShaderMaterial({
+                uniforms: uniforms,
+                vertexShader: vertexShaderSource,
+                fragmentShader: fragmentShaderSource,
+                transparent: true, // Enable transparency for volume rendering
+                side: THREE.BackSide, // Render only back faces to ensure ray starts from inside the box
+            });
+
+            volumeMesh = new THREE.Mesh(geometry, material);
+            scene.add(volumeMesh);
+
+            // --- Raio Visível ---
+            const rayDirectionVector = new THREE.Vector3();
+            const rayOriginVector = new THREE.Vector3();
+            const rayLength = 5; // Fixed length for visualization
+            const hex = 0xffff00; // Yellow color
+            rayHelper = new THREE.ArrowHelper(rayDirectionVector, rayOriginVector, rayLength, hex);
+            scene.add(rayHelper);
+
+            // --- HUD Elements Reference ---
+            hudElements.cameraPos = document.getElementById('camera-pos');
+            hudElements.rayDir = document.getElementById('ray-dir');
+            hudElements.intersectionPoint = document.getElementById('intersection-point');
+            hudElements.numSamples = document.getElementById('num-samples');
+            hudElements.estimatedDepth = document.getElementById('estimated-depth');
+
+            // --- Preview da Câmera (using WebGLRenderTarget) ---
+            const previewResolution = new THREE.Vector2(256, 144); // Small resolution for preview
+
+            // Render target for the main scene
+            renderTarget = new THREE.WebGLRenderTarget(previewResolution.x, previewResolution.y);
+
+            // Scene and Camera for the preview display
+            previewScene = new THREE.Scene();
+            // Orthographic camera for 2D plane displaying the texture
+            previewCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+            previewScene.add(previewCamera);
+
+            // Plane to display the render target's texture
+            const previewGeometry = new THREE.PlaneGeometry(2, 2); // Full screen plane in NDC
+            const previewMaterial = new THREE.MeshBasicMaterial({ map: renderTarget.texture });
+            previewPlane = new THREE.Mesh(previewGeometry, previewMaterial);
+            previewScene.add(previewPlane);
+
+            // Renderer for the preview canvas
+            previewRenderer = new THREE.WebGLRenderer({
+                canvas: previewCanvas,
+                antialias: true
+            });
+            previewRenderer.setSize(previewResolution.x, previewResolution.y);
+            previewRenderer.setPixelRatio(window.devicePixelRatio);
+            
+            // Initial update
+            updateSceneAndHUD();
+            animate();
+        }
+
+        // --- Funções de Atualização ---
+        function updateSceneAndHUD() {
+            // Update shader uniforms
+            volumeMesh.material.uniforms.cameraWorldPosition.value.copy(camera.position);
+            volumeMesh.material.uniforms.projectionMatrixInverse.value.copy(camera.projectionMatrix).invert();
+            volumeMesh.material.uniforms.viewMatrixInverse.value.copy(camera.matrixWorld); // camera.matrixWorld is the inverse of viewMatrix
+
+            // Update Ray Helper
+            const volumeTarget = volumeCenter; // Ray points to the center of the volume
+            const rayOrigin = camera.position;
+            const rayDirection = new THREE.Vector3().subVectors(volumeTarget, rayOrigin).normalize();
+            const distanceToVolume = rayOrigin.distanceTo(volumeTarget);
+
+            rayHelper.position.copy(rayOrigin);
+            rayHelper.setDirection(rayDirection);
+            // Adjust ray length to reach the center of the volume + a bit extra for visibility
+            rayHelper.setLength(distanceToVolume);
+
+            // Update HUD text
+            hudElements.cameraPos.textContent = `X: ${camera.position.x.toFixed(2)}, Y: ${camera.position.y.toFixed(2)}, Z: ${camera.position.z.toFixed(2)}`;
+            hudElements.rayDir.textContent = `X: ${rayDirection.x.toFixed(2)}, Y: ${rayDirection.y.toFixed(2)}, Z: ${rayDirection.z.toFixed(2)}`;
+            hudElements.numSamples.textContent = raymarchingSteps; // Directly display uniform value
+
+            // Calculate intersection point (CPU-side for HUD)
+            const raycaster = new THREE.Raycaster(rayOrigin, rayDirection);
+            const intersects = raycaster.intersectObject(volumeMesh, false); // Only check the bounding box
+
+            if (intersects.length > 0) {
+                const intersectionPoint = intersects[0].point;
+                hudElements.intersectionPoint.textContent = `X: ${intersectionPoint.x.toFixed(2)}, Y: ${intersectionPoint.y.toFixed(2)}, Z: ${intersectionPoint.z.toFixed(2)}`;
+                hudElements.estimatedDepth.textContent = intersects[0].distance.toFixed(2);
+            } else {
+                hudElements.intersectionPoint.textContent = `Nenhum`;
+                hudElements.estimatedDepth.textContent = `N/A`;
+            }
+        }
+
+        // --- Loop de Animação ---
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update(); // Only required if controls.enableDamping is true
+            render();
+        }
+
+        // --- Função de Renderização ---
+        function render() {
+            // 1. Render main scene to render target for preview
+            renderer.setRenderTarget(renderTarget);
+            renderer.render(scene, camera);
+            
+            // 2. Render main scene to main canvas
+            renderer.setRenderTarget(null); // Back to default framebuffer
+            renderer.render(scene, camera);
+
+            // 3. Render preview scene to preview canvas
+            // Use the secondary renderer for the preview canvas
+            previewRenderer.render(previewScene, previewCamera);
+        }
+
+        // --- Tratamento de Redimensionamento da Janela ---
+        function onWindowResize() {
+            camera.aspect = container.clientWidth / container.clientHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(container.clientWidth, container.clientHeight);
+            volumeMesh.material.uniforms.resolution.value.set(container.clientWidth, container.clientHeight);
+
+            // No need to update previewRenderer size on main window resize
+            // The preview canvas handles its own size through CSS.
+            // The render target size remains fixed, but the plane displaying it scales.
+            
+            updateSceneAndHUD(); // Update positions/directions if aspect ratio changes
+        }
+
+        // Adicionar ouvintes de evento
+        window.addEventListener('resize', onWindowResize, false);
+        window.onload = init; // Initialize Three.js on window load
+    </script>
+</body>
+</html>
